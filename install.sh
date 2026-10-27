@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Xray-core 服务端一键部署脚本（Debian 13）
-# VLESS + REALITY + Vision  /  VLESS Encryption (mlkem768x25519plus.native) + Vision
+# VLESS + REALITY + Vision  /  VLESS Encryption + Vision (mlkem768x25519plus.random, 0-RTT)
+# REALITY 入站 decryption=none（按作者建议，REALITY 与 Encryption 二选一，不叠加）；
+# 独立 Encryption 入站：random（全随机外观）、600s 0-RTT ticket、单个 ML-KEM-768 密钥、flow=xtls-rprx-vision
 #
 # 交互界面与流程参考 WHStudio/mihomo-install-script-for-debian（mihomo 版），
 # 本脚本为针对 Xray-core 的独立重写实现。详见 README.zh_CN.md。
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.2.0"
 
 # ── 可通过环境变量覆盖的参数 ────────────────────────────────────────────────
 XRAY_ACTION="${XRAY_ACTION:-}"            # install | update | reconfigure | info | uninstall
@@ -16,11 +18,12 @@ XRAY_VERSION="${XRAY_VERSION:-}"          # 固定版本，如 26.10.21；留空
 GITHUB_PROXY="${GITHUB_PROXY:-}"          # 下载前缀代理，如 https://ghfast.top/
 DEPLOY_MODE="${DEPLOY_MODE:-}"            # both | reality | enc
 REALITY_PORT="${REALITY_PORT:-}"
-ENC_PORT="${ENC_PORT:-}"
+ENC_PORT="${ENC_PORT:-}"                  # 留空 = 随机 4000-9999（避开已占用端口）
 REALITY_TARGET="${REALITY_TARGET:-}"      # host[:port]，port 默认 443
 REALITY_SNI="${REALITY_SNI:-}"            # 逗号分隔的 serverNames，默认 = target 主机名
 CHECK_TARGET="${CHECK_TARGET:-}"          # 1/0：是否用 openssl 检查 target 支持 TLS1.3 + h2
 SERVER_ADDRESS="${SERVER_ADDRESS:-}"      # 客户端连接用的地址（IP 或域名）
+CLIENT_FP="${CLIENT_FP:-}"                # REALITY 节点 client-fingerprint / fp；留空 = 沿用已有，否则 chrome
 DETECT_PUBLIC_IP="${DETECT_PUBLIC_IP:-1}" # 1 = SERVER_ADDRESS 为空时请求 api.ipify.org 探测
 LISTEN_ADDR="${LISTEN_ADDR:-}"            # 留空 = 监听所有地址
 BLOCK_BT="${BLOCK_BT:-}"                  # 1/0：屏蔽 BitTorrent（默认 1）
@@ -49,6 +52,13 @@ readonly NFT_UNIT="${ROOT}/etc/systemd/system/xray-connlimit.service"
 readonly XRAY_USER="xray"
 readonly TAG_REALITY="vless-reality"
 readonly TAG_ENC="vless-enc"
+readonly NAME_REALITY="vless-reality"     # mihomo 节点名 / 链接备注
+readonly NAME_ENC="vless-encryption"
+# VLESS Encryption：random 外观；服务端 600s 0-RTT ticket；单个 ML-KEM-768 密钥（seed 86 / client 1579）
+# （1.1.0 的 X25519+ML-KEM 双密钥、1.0.0 的 native 不再匹配，reconfigure 时会重新生成）
+readonly ENC_DEC_RE='^mlkem768x25519plus\.random\.[0-9]+(-[0-9]+)?s\.[A-Za-z0-9_-]{86}$'
+readonly ENC_ENC_RE='^mlkem768x25519plus\.random\.0rtt\.[A-Za-z0-9_-]{1579}$'
+readonly VISION_FLOW="xtls-rprx-vision"
 
 TEMP_DIR=""
 INTERACTIVE=1
@@ -194,12 +204,21 @@ port_in_use() {
   [[ -n "${out}" && "${out}" != *'"xray"'* ]]
 }
 
+port_listening() {
+  # 返回 0 = 端口已有任意 TCP 监听（含 xray 自身）
+  command -v ss >/dev/null 2>&1 || return 1
+  [[ -n "$(ss -Hltn "sport = :$1" 2>/dev/null || true)" ]]
+}
+
 random_port() {
-  local p
-  while true; do
-    p=$((20000 + RANDOM % 40000))
-    port_in_use "${p}" || { echo "${p}"; return; }
+  # random_port [避开的端口] -> 4000-9999 中一个未被监听的端口
+  local p i avoid="${1:-}"
+  for ((i = 0; i < 200; i++)); do
+    p=$((4000 + RANDOM % 6000))
+    [[ "${p}" != "${avoid}" ]] || continue
+    port_listening "${p}" || { echo "${p}"; return; }
   done
+  die "无法在 4000-9999 中找到空闲端口，请用 ENC_PORT 指定"
 }
 
 xray_env() { XRAY_LOCATION_ASSET="${XRAY_SHARE}" "$@"; }
@@ -400,7 +419,7 @@ jq_cfg() { jq -r "$1" "${XRAY_CONFIG}" 2>/dev/null || true; }
 
 load_existing() {
   OLD_R_PORT=""; OLD_R_UUID=""; OLD_R_PRIV=""; OLD_R_SID=""; OLD_R_TARGET=""; OLD_R_SNI=""
-  OLD_E_PORT=""; OLD_E_UUID=""; OLD_E_DEC=""; OLD_BT=""; OLD_LISTEN=""
+  OLD_E_PORT=""; OLD_E_UUID=""; OLD_E_DEC=""; OLD_BT=""; OLD_LISTEN=""; OLD_R_DEC=""; OLD_E_FLOW=""
   [[ -f "${XRAY_CONFIG}" ]] || return 0
   local r=".inbounds[]? | select(.tag==\"${TAG_REALITY}\")" e=".inbounds[]? | select(.tag==\"${TAG_ENC}\")"
   OLD_R_PORT="$(jq_cfg "${r} | .port")"
@@ -409,9 +428,11 @@ load_existing() {
   OLD_R_SID="$(jq_cfg "${r} | .streamSettings.realitySettings.shortIds[0]")"
   OLD_R_TARGET="$(jq_cfg "${r} | .streamSettings.realitySettings.target")"
   OLD_R_SNI="$(jq_cfg "${r} | .streamSettings.realitySettings.serverNames | join(\",\")")"
+  OLD_R_DEC="$(jq_cfg "${r} | .settings.decryption")"
   OLD_E_PORT="$(jq_cfg "${e} | .port")"
   OLD_E_UUID="$(jq_cfg "${e} | .settings.clients[0].id")"
   OLD_E_DEC="$(jq_cfg "${e} | .settings.decryption")"
+  OLD_E_FLOW="$(jq_cfg "${e} | .settings.clients[0].flow // empty")"
   OLD_LISTEN="$(jq_cfg '[.inbounds[]? | .listen // empty][0] // empty')"
   if [[ -n "$(jq_cfg '.routing.rules[]? | select(.protocol? | index("bittorrent")) | .outboundTag')" ]]; then OLD_BT=1; else OLD_BT=0; fi
 }
@@ -422,12 +443,48 @@ reality_pubkey() {
 }
 
 enc_client_from_dec() {
-  # decryption = mlkem768x25519plus.native.600s.<seed>  ->  encryption = mlkem768x25519plus.native.0rtt.<client>
-  local dec="$1" seed client
-  seed="${dec##*.}"
-  client="$("${XRAY_BIN}" mlkem768 -i "${seed}" | awk -F': *' '$1 == "Client" { print $2; exit }' | tr -d '\r')"
-  [[ "${client}" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
-  printf 'mlkem768x25519plus.native.0rtt.%s\n' "${client}"
+  # 服务端 decryption -> 客户端 encryption（逐个 key 推导，保持顺序；ticket 段改为 0rtt）
+  #   mlkem768x25519plus.<mode>.600s.<ML-KEM-768 seed>
+  #   -> mlkem768x25519plus.<mode>.0rtt.<ML-KEM-768 client>
+  # 也兼容 1.0.0（native 单 seed）/ 1.1.0（X25519 + ML-KEM 双密钥）旧配置（仅用于 info 显示）
+  local dec="$1" k pub out=""
+  local -a parts
+  IFS='.' read -r -a parts <<< "${dec}"
+  ((${#parts[@]} >= 4)) && [[ "${parts[0]}" == "mlkem768x25519plus" ]] || return 1
+  [[ "${parts[1]}" =~ ^(native|xorpub|random)$ ]] || return 1
+  for k in "${parts[@]:3}"; do
+    case "${#k}" in
+      43) pub="$(reality_pubkey "${k}")" ;;
+      86) pub="$("${XRAY_BIN}" mlkem768 -i "${k}" | awk -F': *' '$1 == "Client" { print $2; exit }' | tr -d '\r')" ;;
+      *) return 1 ;;
+    esac
+    [[ "${pub}" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+    out+=".${pub}"
+  done
+  printf 'mlkem768x25519plus.%s.0rtt%s\n' "${parts[1]}" "${out}"
+}
+
+gen_enc_pair() {
+  # 生成一个新的 VLESS Encryption 密钥（单个 ML-KEM-768，不混用 X25519 -> 作者建议 "do not mix them"）
+  #   -> GEN_DEC（服务端 decryption）/ GEN_ENC（客户端 encryption）
+  local m seed client
+  m="$("${XRAY_BIN}" mlkem768 | tr -d '\r')"
+  seed="$(awk -F': *' '$1 == "Seed" { print $2; exit }' <<< "${m}")"
+  client="$(awk -F': *' '$1 == "Client" { print $2; exit }' <<< "${m}")"
+  GEN_DEC="mlkem768x25519plus.random.600s.${seed}"
+  GEN_ENC="mlkem768x25519plus.random.0rtt.${client}"
+  [[ "${GEN_DEC}" =~ ${ENC_DEC_RE} && "${GEN_ENC}" =~ ${ENC_ENC_RE} ]] || die "VLESS Encryption 密钥生成/解析失败"
+}
+
+yaml_val() {
+  # 默认输出 plain 标量（与参考格式一致）；只有会被 YAML 误读的值才加引号
+  local v="$1"
+  if [[ -z "${v}" || "${v}" =~ ^[-+]?([0-9_]+(\.[0-9_]*)?|\.[0-9]+)([eE][-+]?[0-9]+)?$ || "${v}" =~ ^0[xXoObB] \
+        || "${v,,}" =~ ^(true|false|yes|no|on|off|y|n|null|~)$ || "${v}" =~ ^[:\[\{\&\*\!\|\>\'\"%@\`] || "${v}" == *" #"* || "${v}" == *": "* ]]; then
+    printf '"%s"' "${v}"
+  else
+    printf '%s' "${v}"
+  fi
 }
 
 # ── 配置问答 ───────────────────────────────────────────────────────────────
@@ -435,8 +492,8 @@ choose_mode() {
   if [[ -z "${DEPLOY_MODE}" && "${INTERACTIVE}" -eq 1 ]]; then
     section "部署模式"
     menu_item "1" "两者都部署" "[默认] REALITY 直连 + Encryption 备用/中转"
-    menu_item "2" "仅 VLESS + REALITY + Vision"
-    menu_item "3" "仅 VLESS Encryption (ML-KEM-768) + Vision"
+    menu_item "2" "仅 VLESS + REALITY + Vision（叠加 Encryption）"
+    menu_item "3" "仅 VLESS Encryption (random, 0-RTT)"
     printf '\n' >&2
     while true; do
       ask "请输入选项 [1-3]" "1"
@@ -510,7 +567,7 @@ check_target() {
 }
 
 configure_reality() {
-  section "VLESS + REALITY + Vision"
+  section "VLESS + REALITY + Vision（叠加 VLESS Encryption）"
   local def_port="${OLD_R_PORT:-443}" def_target="${OLD_R_TARGET}" sni_def tgt
   [[ "${KEEP}" -eq 1 ]] || def_port=443
   pick_port "REALITY" "${def_port}" "" "${REALITY_PORT}"
@@ -575,8 +632,15 @@ reality_keys() {
     R_UUID="$("${XRAY_BIN}" uuid | tr -d '\r\n')"
     kp="$("${XRAY_BIN}" x25519 | tr -d '\r')"
     R_PRIV="$(awk -F': *' '$1 == "PrivateKey" { print $2; exit }' <<< "${kp}")"
-    R_SID="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+    # shortId 至少含一个 a-d/f，保证在 YAML 中不加引号也不会被解析成数字
+    R_SID=""
+    until [[ "${R_SID}" =~ [a-df] ]]; do R_SID="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"; done
     ok "已生成新的 UUID、x25519 密钥对与 shortId"
+  fi
+  # REALITY 入站不叠加 VLESS Encryption（作者：REALITY 与 Encryption 二选一）
+  R_ENC=""
+  if [[ "${KEEP}" -eq 1 && -n "${OLD_R_DEC}" && "${OLD_R_DEC}" != "none" ]]; then
+    warn "REALITY 入站已移除 VLESS Encryption（decryption=none）：客户端 REALITY 节点需要更新（删除 encryption）"
   fi
   R_PUB="$(reality_pubkey "${R_PRIV}")"
   [[ "${R_UUID}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || die "UUID 无效"
@@ -585,32 +649,39 @@ reality_keys() {
 }
 
 configure_enc() {
-  section "VLESS Encryption (mlkem768x25519plus.native) + Vision"
+  section "VLESS Encryption (mlkem768x25519plus.random, 0-RTT)"
   local def_port
-  if [[ "${KEEP}" -eq 1 && -n "${OLD_E_PORT}" ]]; then def_port="${OLD_E_PORT}"; else def_port="$(random_port)"; fi
-  [[ "${def_port}" != "${R_PORT:-}" ]] || def_port="$(random_port)"
+  if [[ "${KEEP}" -eq 1 && -n "${OLD_E_PORT}" ]]; then def_port="${OLD_E_PORT}"; else def_port="$(random_port "${R_PORT:-}")"; fi
+  [[ "${def_port}" != "${R_PORT:-}" ]] || def_port="$(random_port "${R_PORT:-}")"
   pick_port "Encryption" "${def_port}" "${R_PORT:-}" "${ENC_PORT}"
   E_PORT="${SELECTED_PORT}"
 }
 
 enc_keys() {
-  if [[ "${KEEP}" -eq 1 && -n "${OLD_E_DEC}" && -n "${OLD_E_UUID}" ]]; then
-    E_UUID="${OLD_E_UUID}"; E_DEC="${OLD_E_DEC}"
-    E_ENC="$(enc_client_from_dec "${E_DEC}")" || die "无法从现有 decryption 推导客户端 encryption"
-    info "沿用已有 Encryption UUID / 密钥"
+  if [[ "${KEEP}" -eq 1 && -n "${OLD_E_UUID}" ]]; then
+    E_UUID="${OLD_E_UUID}"
+    info "沿用已有 Encryption UUID"
   else
-    local out
     E_UUID="$("${XRAY_BIN}" uuid | tr -d '\r\n')"
     [[ "${E_UUID}" != "${R_UUID:-}" ]] || E_UUID="$("${XRAY_BIN}" uuid | tr -d '\r\n')"
-    out="$("${XRAY_BIN}" vlessenc | tr -d '\r')"
-    # 取 "Authentication: ML-KEM-768, Post-Quantum" 段
-    E_DEC="$(awk '/ML-KEM-768/ { f=1 } f && /"decryption"/ { gsub(/"/, "", $2); print $2; exit }' <<< "${out}")"
-    E_ENC="$(awk '/ML-KEM-768/ { f=1 } f && /"encryption"/ { gsub(/"/, "", $2); print $2; exit }' <<< "${out}")"
-    ok "已通过 xray vlessenc 生成 ML-KEM-768 密钥"
   fi
+  if [[ "${KEEP}" -eq 1 && "${OLD_E_DEC}" =~ ${ENC_DEC_RE} ]]; then
+    E_DEC="${OLD_E_DEC}"
+    E_ENC="$(enc_client_from_dec "${E_DEC}")" || die "无法从现有 decryption 推导客户端 encryption"
+    info "沿用已有 Encryption 密钥"
+    [[ "${OLD_E_FLOW}" == "${VISION_FLOW}" ]] || warn "Encryption 入站新增 flow=${VISION_FLOW}：客户端需要更新"
+  else
+    gen_enc_pair
+    E_DEC="${GEN_DEC}"; E_ENC="${GEN_ENC}"
+    ok "已生成 VLESS Encryption 密钥（单个 ML-KEM-768，random / 0-RTT）"
+    if [[ "${KEEP}" -eq 1 && -n "${OLD_E_DEC}" ]]; then
+      warn "旧版（1.0.0/1.1.0）Encryption 配置已升级为 random + 单个 ML-KEM-768 + Vision，密钥已重新生成："
+      warn "  所有客户端的 ${NAME_ENC} 节点都必须更新（UUID 与端口不变）"
+    fi
+  fi
+  E_FLOW="${VISION_FLOW}"
   [[ "${E_UUID}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || die "UUID 无效"
-  [[ "${E_DEC}" =~ ^mlkem768x25519plus\.native\.[0-9]+(-[0-9]+)?s\.[A-Za-z0-9_-]+$ ]] || die "decryption 解析失败"
-  [[ "${E_ENC}" =~ ^mlkem768x25519plus\.native\.0rtt\.[A-Za-z0-9_-]+$ ]] || die "encryption 解析失败"
+  [[ "${E_ENC}" =~ ${ENC_ENC_RE} ]] || die "encryption 解析失败"
 }
 
 configure_misc() {
@@ -666,11 +737,13 @@ build_config() {
       } + (if $sniff then { sniffing: $sniff } else {} end)]')"
   fi
   if [[ "${DO_ENC}" -eq 1 ]]; then
+    # flow=xtls-rprx-vision：Vision 填充 + 内层 TLS 直连复制；random 外观不会 splice（inbound.go:563-565），
+    # 但整条流量（含 5 字节记录头）全随机，无 TLS 特征
     inbounds="$(jq -n --argjson acc "${inbounds}" --arg tag "${TAG_ENC}" --argjson port "${E_PORT}" \
-      --arg id "${E_UUID}" --arg dec "${E_DEC}" --argjson sniff "${sniff}" '
+      --arg id "${E_UUID}" --arg dec "${E_DEC}" --arg flow "${E_FLOW}" --argjson sniff "${sniff}" '
       $acc + [{
         tag: $tag, port: $port, protocol: "vless",
-        settings: { clients: [{ id: $id, flow: "xtls-rprx-vision" }], decryption: $dec },
+        settings: { clients: [{ id: $id, flow: $flow }], decryption: $dec },
         streamSettings: { network: "raw", security: "none" }
       } + (if $sniff then { sniffing: $sniff } else {} end)]')"
   fi
@@ -875,51 +948,65 @@ detect_address() {
   [[ "${SERVER_ADDRESS}" =~ ^[A-Za-z0-9.:_-]+$ ]] || die "SERVER_ADDRESS 只能是 IP 或域名"
 }
 
+resolve_client_fp() {
+  # 优先级：CLIENT_FP 环境变量 > 已有 YAML 中的 client-fingerprint > chrome
+  if [[ -z "${CLIENT_FP}" && -f "${CLIENT_YAML}" ]]; then
+    CLIENT_FP="$(awk '/^    client-fingerprint: / { print $2; exit }' "${CLIENT_YAML}" | tr -d '"')"
+  fi
+  CLIENT_FP="${CLIENT_FP:-chrome}"
+  [[ "${CLIENT_FP}" =~ ^[a-z0-9_]+$ ]] || die "CLIENT_FP 无效：${CLIENT_FP}"
+}
+
 write_client_files() {
   # 只使用客户端需要的公开参数（UUID、公钥、shortId、encryption）
-  local host_link="${SERVER_ADDRESS}" yaml links name_r="xray-reality" name_e="xray-vless-enc"
+  # 格式（字段集合、顺序、取值风格）与 mihomo 一键脚本输出一致；额外保留 reality-opts.support-x25519mlkem768
+  local host_link="${SERVER_ADDRESS}" yaml links srv
   is_ipv6 "${SERVER_ADDRESS}" && host_link="[${SERVER_ADDRESS}]"
-  yaml="# mihomo 客户端 proxies（由 xray-install-script 生成，$(date '+%F %T %Z')）
-# 注意：连接 Xray >= v26.9.9 的 REALITY 必须开启 support-x25519mlkem768
-proxies:"
+  srv="$(yaml_val "${SERVER_ADDRESS}")"
+  resolve_client_fp
+  yaml="proxies:"
   links=""
-  if [[ "${DO_REALITY}" -eq 1 ]]; then
-    yaml+="
-  - name: ${name_r}
-    type: vless
-    server: \"${SERVER_ADDRESS}\"
-    port: ${R_PORT}
-    uuid: ${R_UUID}
-    network: tcp
-    udp: true
-    packet-encoding: xudp
-    flow: xtls-rprx-vision
-    encryption: \"\"
-    tls: true
-    servername: ${R_SNIS[0]}
-    client-fingerprint: chrome
-    skip-cert-verify: false
-    reality-opts:
-      public-key: ${R_PUB}
-      short-id: \"${R_SID}\"
-      support-x25519mlkem768: true"
-    links+="vless://${R_UUID}@${host_link}:${R_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${R_SNIS[0]}&fp=chrome&pbk=${R_PUB}&sid=${R_SID}&type=tcp&headerType=none#${name_r}
-"
-  fi
   if [[ "${DO_ENC}" -eq 1 ]]; then
     yaml+="
-  - name: ${name_e}
+  - name: ${NAME_ENC}
     type: vless
-    server: \"${SERVER_ADDRESS}\"
+    server: ${srv}
     port: ${E_PORT}
-    uuid: ${E_UUID}
-    network: tcp
     udp: true
+    uuid: ${E_UUID}"
+    # 新配置总是 flow=xtls-rprx-vision；仅 1.1.0 旧配置（未 reconfigure）的 info 显示不带 flow
+    [[ -z "${E_FLOW:-}" ]] || yaml+="
+    flow: ${E_FLOW}"
+    yaml+="
     packet-encoding: xudp
+    network: tcp
+    encryption: ${E_ENC}"
+    links+="vless://${E_UUID}@${host_link}:${E_PORT}?encryption=${E_ENC}${E_FLOW:+&flow=${E_FLOW}}&security=none&type=tcp&headerType=none#${NAME_ENC}
+"
+  fi
+  if [[ "${DO_REALITY}" -eq 1 ]]; then
+    yaml+="
+  - name: ${NAME_REALITY}
+    type: vless
+    server: ${srv}
+    port: ${R_PORT}
+    udp: true
+    uuid: ${R_UUID}
     flow: xtls-rprx-vision
-    tls: false
-    encryption: \"${E_ENC}\""
-    links+="vless://${E_UUID}@${host_link}:${E_PORT}?encryption=${E_ENC}&flow=xtls-rprx-vision&security=none&type=tcp&headerType=none#${name_e}
+    packet-encoding: xudp
+    network: tcp
+    tls: true
+    servername: ${R_SNIS[0]}
+    reality-opts:
+      public-key: ${R_PUB}
+      short-id: $(yaml_val "${R_SID}")
+      support-x25519mlkem768: true
+    skip-cert-verify: false
+    client-fingerprint: ${CLIENT_FP}"
+    # 仅当旧版（1.1.0）REALITY 入站仍带 decryption 时（未 reconfigure 的 info 显示）输出 encryption
+    [[ -z "${R_ENC:-}" ]] || yaml+="
+    encryption: ${R_ENC}"
+    links+="vless://${R_UUID}@${host_link}:${R_PORT}?encryption=${R_ENC:-none}&flow=xtls-rprx-vision&security=reality&sni=${R_SNIS[0]}&fp=${CLIENT_FP}&pbk=${R_PUB}&sid=${R_SID}&type=tcp&headerType=none#${NAME_REALITY}
 "
   fi
   ( umask 077; printf '%s\n' "${yaml}" > "${CLIENT_YAML}"; printf '%s' "${links}" > "${LINKS_FILE}" )
@@ -928,8 +1015,8 @@ proxies:"
 
 print_client_info() {
   local ports=()
-  [[ "${DO_REALITY}" -eq 1 ]] && ports+=("${R_PORT}")
   [[ "${DO_ENC}" -eq 1 ]] && ports+=("${E_PORT}")
+  [[ "${DO_REALITY}" -eq 1 ]] && ports+=("${R_PORT}")
   section "客户端配置（mihomo proxies）"
   printf '\n' >&2
   cat "${CLIENT_YAML}"
@@ -941,6 +1028,19 @@ print_client_info() {
   info "请在防火墙/安全组放行 TCP 端口：${C_BOLD}${ports[*]}${C_RESET}"
   info "客户端 YAML：${CLIENT_YAML#"${ROOT}"}（权限 600）；链接：${LINKS_FILE#"${ROOT}"}"
   info "以上仅含客户端所需的公开参数，服务端私钥只保存在 ${XRAY_CONFIG#"${ROOT}"}（640 root:xray）"
+  if [[ "${DO_REALITY}" -eq 1 ]]; then
+    info "mihomo 连接 Xray >= v26.9.9 的 REALITY 必须保留 support-x25519mlkem768: true"
+    if [[ "${CLIENT_FP}" != "chrome" ]]; then
+      warn "client-fingerprint 为 ${CLIENT_FP}：mihomo（utls v1.8.8）中只有 chrome 发送 X25519MLKEM768，其他指纹会被 Xray REALITY 拒绝；"
+      warn "  mihomo 客户端请用默认的 chrome：CLIENT_FP=chrome bash install.sh info"
+    fi
+  fi
+  if [[ "${DO_ENC}" -eq 1 || -n "${R_ENC:-}" ]]; then
+    info "VLESS Encryption 0-RTT：服务端重启后客户端缓存的 ticket 失效，首个连接可能失败，随后自动恢复"
+  fi
+  if [[ -n "${R_ENC:-}" || ( "${DO_ENC}" -eq 1 && ! "${E_DEC:-${OLD_E_DEC:-}}" =~ ${ENC_DEC_RE} ) ]]; then
+    warn "当前为旧版（<1.2.0）配置，建议运行 reconfigure 升级（Encryption 改为 random + 单个 ML-KEM-768 + Vision；REALITY 不叠加 Encryption），之后客户端需要更新"
+  fi
 }
 
 success_box() {
@@ -1047,17 +1147,21 @@ load_for_info() {
   if [[ -n "${OLD_R_PRIV}" ]]; then
     DO_REALITY=1; R_PORT="${OLD_R_PORT}"; R_UUID="${OLD_R_UUID}"; R_SID="${OLD_R_SID}"
     R_PUB="$(reality_pubkey "${OLD_R_PRIV}")"
+    R_ENC=""
+    if [[ -n "${OLD_R_DEC}" && "${OLD_R_DEC}" != "none" ]]; then
+      R_ENC="$(enc_client_from_dec "${OLD_R_DEC}")" || die "无法推导 REALITY encryption"
+    fi
     IFS=',' read -r -a R_SNIS <<< "${OLD_R_SNI}"
   fi
   if [[ -n "${OLD_E_DEC}" ]]; then
-    DO_ENC=1; E_PORT="${OLD_E_PORT}"; E_UUID="${OLD_E_UUID}"
+    DO_ENC=1; E_PORT="${OLD_E_PORT}"; E_UUID="${OLD_E_UUID}"; E_FLOW="${OLD_E_FLOW}"
     E_ENC="$(enc_client_from_dec "${OLD_E_DEC}")" || die "无法推导 encryption"
   fi
 }
 
 do_info() {
   if [[ -z "${SERVER_ADDRESS}" && -f "${CLIENT_YAML}" ]]; then
-    SERVER_ADDRESS="$(awk -F'"' '/^    server: /{ print $2; exit }' "${CLIENT_YAML}")"
+    SERVER_ADDRESS="$(awk '/^    server: / { print $2; exit }' "${CLIENT_YAML}" | tr -d '"')"
   fi
   load_for_info
   detect_address

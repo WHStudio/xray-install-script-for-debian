@@ -1,0 +1,28 @@
+proxies:
+  - name: vless-encryption
+    type: vless
+    server:
+    port:
+    udp: true
+    uuid:
+    flow: xtls-rprx-vision
+    packet-encoding: xudp
+    network: tcp
+    encryption: mlkem768x25519plus.random.0rtt.<1579>
+  - name: vless-reality
+    type: vless
+    server:
+    port:
+    udp: true
+    uuid:
+    flow: xtls-rprx-vision
+    packet-encoding: xudp
+    network: tcp
+    tls: true
+    servername:
+    reality-opts:
+      public-key:
+      short-id:
+      support-x25519mlkem768: true
+    skip-cert-verify: false
+    client-fingerprint: chrome
