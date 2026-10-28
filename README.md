@@ -1,11 +1,13 @@
 # xray-install-script-for-debian
 
-适用于Debian13的xray服务端部署脚本
+在 Debian 13 上轻松部署 Xray-core 及其两大核心协议。
 
-在 Debian 13 上部署 Xray-core（v1.3.0）。Encryption 入站为 `mlkem768x25519plus`（外观 native / xorpub / random，默认 random）+ Vision；REALITY 入站为 VLESS + REALITY + Vision，不叠加 VLESS Encryption；mihomo 客户端指纹为 chrome。freedom 出站的 DNS `domainStrategy` 写在 `streamSettings.sockopt`，默认 `UseIPv4v6`。完整说明见 [README.zh_CN.md](README.zh_CN.md)。
+Encryption 入站为 `mlkem768x25519plus`（外观 native / xorpub / random 自选其一，默认 random）+ Vision；REALITY 入站为 VLESS + REALITY + Vision。
+
+完整说明见 [README.zh_CN.md](README.zh_CN.md)，全部由 AI 生成，请谨慎分辨。
 
 ## 快速开始
 
 ```bash
-bash install.sh
+bash <(curl -fsSL https://raw.githubusercontent.com/WHStudio/xray-install-script-for-debian/main/install.sh)
 ```
