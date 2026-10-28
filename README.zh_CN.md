@@ -5,7 +5,7 @@
 | 入站 | 协议 | 默认端口 |
 |---|---|---|
 | `vless-reality` | VLESS + REALITY + `xtls-rprx-vision`，`decryption: none`（不叠加 Encryption） | 443 |
-| `vless-enc` | VLESS Encryption `mlkem768x25519plus.random`（0-RTT；单个 ML-KEM-768 密钥）+ `xtls-rprx-vision`，`security: none` | 4000–9999 随机（避开已占用端口） |
+| `vless-enc` | VLESS Encryption `mlkem768x25519plus`（外观 native / xorpub / random 可选，默认 random；0-RTT；单个 ML-KEM-768 密钥）+ `xtls-rprx-vision`，`security: none` | 4000–9999 随机（避开已占用端口） |
 
 本项目是作者本人 mihomo 一键脚本 [WHStudio/mihomo-install-script-for-debian](https://github.com/WHStudio/mihomo-install-script-for-debian) 的 Xray-core 对应版本：交互界面与流程沿用 mihomo 版，代码针对 Xray-core 重写。
 
@@ -55,9 +55,11 @@ bash install.sh [install|update|reconfigure|info|uninstall] [--purge] [-y]
 | `CLIENT_FP` | REALITY 节点的 `client-fingerprint`（YAML）/ `fp`（链接）。mihomo 客户端连 Xray REALITY 必须用 `chrome`，见注意事项 | 沿用已有 YAML，否则 `chrome` |
 | `DETECT_PUBLIC_IP` | 设为 1 时，若 `SERVER_ADDRESS` 为空，就请求 api.ipify.org 探测公网 IP | 1 |
 | `LISTEN_ADDR` | 监听地址 | 所有地址 |
-| `BLOCK_BT` | 是否屏蔽 BitTorrent（会开启 sniffing，`routeOnly`） | 1 |
-| `ACCESS_LOG` | 设为 1 时访问日志写入 journal | 0 |
-| `NFT_CONNLIMIT` | 每个 IP 的并发 TCP 连接上限。设为 0 或留空表示不启用 | 不启用 |
+| `ENC_MODE` | Encryption 外观：`native` / `xorpub` / `random`，取舍见下方「Encryption 外观选择」 | 沿用已有，否则 `random` |
+| `DOMAIN_STRATEGY` | direct 出站（freedom）的 `streamSettings.sockopt.domainStrategy`：`AsIs` / `UseIPv4v6` / `UseIPv6v4` / `UseIPv4` / `UseIPv6` / `ForceIPv4v6` / `ForceIPv6v4` / `ForceIPv4` / `ForceIPv6`（大小写不敏感，其他值报错），见下方「出站 DNS 解析策略」 | 沿用已有，否则 `UseIPv4v6` |
+| `BLOCK_BT` | 是否屏蔽 BitTorrent（会开启 sniffing，`routeOnly`） | 沿用已有，否则 1 |
+| `ACCESS_LOG` | 1 = 访问日志写入 journal，0 = 关闭 | 沿用已有，否则 0 |
+| `NFT_CONNLIMIT` | 每个 IP 的并发 TCP 连接上限，0 = 不启用。留空时沿用已有的 `connlimit.nft`（交互模式以它为默认值） | 沿用已有，否则不启用 |
 | `KEEP_KEYS` | 重新配置时是否沿用已有的 UUID 和密钥 | 1 |
 | `PURGE` | 卸载时设为 1，会同时删除配置和 `xray` 用户 | 0 |
 | `SKIP_START` | 设为 1 时只写文件，不启动服务 | 0 |
@@ -85,15 +87,23 @@ bash install.sh [install|update|reconfigure|info|uninstall] [--purge] [-y]
 ## 服务端配置要点
 
 - 日志级别为 `warning`，`access: none`，`dnsLog: false`。不开启 API、stats，也不配置 fallbacks。
+  - 生成的配置不含任何已弃用字段，`xray run -test` 无 Warning；脚本校验配置时若出现 Warning 会原样（隐去长密钥串）显示出来。
+  - 唯一的例外是 Xray 自身每次启动都以 Warning 级别打印的 `[Warning] core: Xray 26.10.21 started`（core/xray.go:400），与配置无关。
+  - 以下情况 Xray 会在启动时打印 Warning，脚本在选择时会提前提示：REALITY 不在 443 端口（infra/conf/xray.go:187）；serverNames 以 `.cn` / `.ru` / `.ir` 结尾或含 `apple` / `icloud` / `microsoft`（infra/conf/transport_security.go:163-168）。
 - **VLESS Encryption（仅 `vless-enc` 入站）**，按 [XTLS/Xray-core#5067](https://github.com/XTLS/Xray-core/pull/5067) 作者的建议配置：
-  - 用 `xray mlkem768` 生成**单个** ML-KEM-768 密钥，不混用 X25519（作者原话 "do not mix them"）。服务端 decryption 为 `mlkem768x25519plus.random.600s.<ML-KEM-768 seed>`，客户端 encryption 为 `mlkem768x25519plus.random.0rtt.<ML-KEM-768 client>`。
-  - `random`：整条流量（包括每条记录的 5 字节头）都 XOR 成全随机外观。`native`/`xorpub` 的数据记录带 TLS 1.3 应用数据头 `17 03 03 len`，Wireshark 默认会识别成 TLS；`random` 没有这个特征（本地抓包已验证）。代价是不能 splice（inbound.go:563-565）。
+  - 用 `xray mlkem768` 生成**单个** ML-KEM-768 密钥，不混用 X25519（作者原话 "do not mix them"）。服务端 decryption 为 `mlkem768x25519plus.<外观>.600s.<ML-KEM-768 seed>`，客户端 encryption 为 `mlkem768x25519plus.<外观>.0rtt.<ML-KEM-768 client>`，`<外观>` 为 `native` / `xorpub` / `random`（两端必须一致）。
   - `600s`：服务端签发 600 秒 0-RTT ticket（`xray vlessenc` 的默认值）。保留默认 padding。
-  - 沿用密钥时，客户端串由 `xray mlkem768 -i` 重新推导。
-- **从旧版本升级**：1.0.0（native）和 1.1.0（random，X25519 + ML-KEM 双密钥，REALITY 也叠加 Encryption）的配置，用 1.2.0 执行 `reconfigure`（或 `install`）时会自动转换：
-  - Encryption 入站：重新生成密钥，加上 Vision。UUID 和端口保留。
-  - REALITY 入站：去掉 decryption，改为 `none`。UUID、密钥和 shortId 保留。
-  - 脚本会给出警告。**两个节点的客户端配置都必须更新**（Encryption 节点换 encryption 串并加 flow，REALITY 节点删除 encryption）。
+  - 沿用密钥时，客户端串由 `xray mlkem768 -i` 重新推导。密钥与外观无关：沿用密钥但换外观时只替换外观段，seed 不变，脚本会提示客户端需更新 encryption 字段。
+
+- **从旧版本升级**（用 1.3.0 执行 `reconfigure` 或 `install`，沿用密钥）：
+  - 1.2.0：密钥、外观（random）不变；direct 出站新增 `streamSettings.sockopt.domainStrategy`（默认 `UseIPv4v6`）。客户端无需更新。
+  - 早期 1.3.0 测试版写在已弃用的 `settings.domainStrategy`：重新配置时读取原值并迁移到 `sockopt`，并给出提示。
+  - 重新配置时默认沿用现有设置：部署模式、REALITY target/serverNames、BitTorrent 屏蔽、访问日志、nftables 连接上限、监听地址、客户端用的服务器地址（取自现有 client-mihomo.yaml）。非交互 `reconfigure` 不再要求重新传 `REALITY_TARGET`。
+  - 1.0.0（native、单个 ML-KEM-768 seed、Vision）：现已是合法的 1.3.0 配置，沿用 native 外观与密钥，客户端无需更新。
+  - 1.1.0（random，X25519 + ML-KEM 双密钥，REALITY 也叠加 Encryption）会自动转换：
+    - Encryption 入站：重新生成密钥（外观默认 random，可用 `ENC_MODE` 指定），加上 Vision。UUID 和端口保留。
+    - REALITY 入站：去掉 decryption，改为 `none`。UUID、密钥和 shortId 保留。
+    - 脚本会给出警告。**两个节点的客户端配置都必须更新**（Encryption 节点换 encryption 串并加 flow，REALITY 节点删除 encryption）。
   - 未升级前执行 `info`，会按旧服务端配置原样输出，并提示升级。
 - **REALITY 入站**：
   - 密钥用 `xray x25519` 生成；shortId 是随机 8 字节（16 个十六进制字符，保证至少含一个字母，YAML 中不会被当成数字）。
@@ -101,11 +111,11 @@ bash install.sh [install|update|reconfigure|info|uninstall] [--purge] [-y]
   - 用户 `flow: xtls-rprx-vision`，`decryption: none`。作者的建议是 REALITY 与 Encryption 二选一，不叠加。
 - **Encryption 入站**：用户 `flow: xtls-rprx-vision`，客户端必须同样带 flow（Xray 会拒绝 flow 不一致的请求，inbound.go:583-585）。
   - Vision 提供长度填充；内层是 TLS 1.3 时，会切换为直接复制。
-  - random 下不会 splice（proxy.go:690-712，XorConn 不穿透），但记录头仍被 XOR，外层看不到 `17 03 03`。
-  - 直接复制阶段，内层 TLS 记录的密文正文按原样传输，只有记录头被 XOR，所以内层记录的长度分布可见。内层 ClientHello/SNI 在切换前已加密，不会暴露。
+  - native/xorpub 下服务端可 splice；random 下不会 splice（proxy.go:690-712，XorConn 不穿透），但记录头仍被 XOR，外层看不到 `17 03 03`。
+  - 直接复制阶段，内层 TLS 记录的密文正文按原样传输（random 只 XOR 记录头），所以内层记录的长度分布可见。内层 ClientHello/SNI 在切换前已加密，不会暴露。
 - **屏蔽私有地址**：
   - routing 中设置 `geoip:private → blackhole`。
-  - freedom 出站中 `finalRules` 设置 `block geoip:private`。即使目标是域名、解析后落到内网，也会被拦截。
+  - freedom 出站中 `finalRules` 设置 `block geoip:private`。即使目标是域名、解析后落到内网，也会被拦截（任何 `domainStrategy` 下都有效，见上文）。
 - 可选屏蔽 BitTorrent（`protocol: bittorrent → blackhole`）。
 - **systemd 加固**：
   - 以 `User=xray` 运行。能力只有 `CAP_NET_BIND_SERVICE`（Bounding 和 Ambient 均如此），并设置 `NoNewPrivileges`。
@@ -118,7 +128,34 @@ bash install.sh [install|update|reconfigure|info|uninstall] [--purge] [-y]
 - **nftables 连接数限制**：
   - 使用独立的表 `inet xray_connlimit`，不动其他表。
   - 超过上限的新连接会被 `ct count over N` 规则以 TCP RST 拒绝。
-  - 规则由 oneshot 服务 `xray-connlimit.service` 在开机时加载。
+  - 规则由 oneshot 服务 `xray-connlimit.service` 在开机时加载。加载失败（如容器内缺少 CAP_NET_ADMIN）只给出警告，不影响 xray 启动和客户端文件生成。
+
+### Encryption 外观选择（`ENC_MODE`）
+
+安装/重新配置 Encryption 入站时会询问外观，并列出以下取舍（默认 `random`；重新配置时默认沿用现有外观）：
+
+| 外观 | 优势 | 风险 |
+|---|---|---|
+| `native` | 配合 Vision 服务端可 splice（零拷贝，性能最好）；作者推荐 native/xorpub + Vision（"最佳性能是 native/xorpub + XTLS ReadV/Splice"） | 数据记录头为 TLS 1.3 应用数据头 `17 03 03 len`，tshark/Wireshark 会标为 TLS Application Data（但没有握手、SNI、JA3）；握手中的公钥字节未隐藏 |
+| `xorpub` | 同 native（可 splice，作者推荐），另对握手中的 X25519 公钥 / ML-KEM 密文做 XOR，隐藏其特征 | 数据记录头仍为 `17 03 03`，同样会被标为 TLS Application Data（无握手/SNI/JA3） |
+| `random` | 记录头也做 XOR，整条流量呈全随机外观，抓包无 TLS 特征（本项目回环抓包已验证） | 不能 splice（inbound.go:563-565、proxy.go:690-712），性能低于 native/xorpub；PR #5067 正文称 GFW 已将全随机外观列入黑名单——这是作者的判断，**未核实** |
+
+### 出站 DNS 解析策略（`DOMAIN_STRATEGY`）
+
+写入 `outbounds[tag=direct].streamSettings.sockopt.domainStrategy`（不写 `settings.domainStrategy`）。交互模式依次询问：
+
+1. **域名解析交给系统处理（AsIs）？** 选"是"即为 `AsIs`，后两问跳过。默认"否"。
+2. **Xray 内置解析失败后回退到系统处理？** "是" = `Use*`（内置解析失败时按域名交给系统拨号），"否" = `Force*`（失败即报错，不回退）。默认"是"。
+3. **解析顺序**：`v4`（只 IPv4）/ `v6`（只 IPv6）/ `v4v6`（先 IPv4 后 IPv6）/ `v6v4`（先 IPv6 后 IPv4）。默认 `v4v6`。
+
+全部取默认得到 `UseIPv4v6`。重新配置时默认值来自现有配置；1.2.0 及更早的配置没有该字段（等同 AsIs），升级后会写入新默认 `UseIPv4v6`，如需保持旧行为请设 `DOMAIN_STRATEGY=AsIs` 或在第 1 问选"是"。
+
+说明（基于 Xray v26.10.21 源码）：
+
+- **内置解析用的是什么**：配置里没有 `dns` 段时，Xray 注册默认的 `localdns` 客户端（core/xray.go:218），它调用 Go 的 `net.LookupIP`，即读取系统的 `/etc/resolv.conf` / hosts，再按 v4/v6 选项过滤（features/dns/localdns/client.go:32-38）。所以 Use*/Force* 与 AsIs 用的是同一套系统解析器，区别在于地址族选择、顺序和是否回退。脚本**不添加** `dns` 段，也不写入任何公共 DNS 服务器。
+- **私有地址屏蔽仍然有效**：freedom 在目标为域名且有 finalRules 时，Use*/Force* 下先用内置解析得到 IP，逐个检查 finalRules（命中 `geoip:private` 即 block）；拨号后再对实际连接的远端地址检查一次（proxy/freedom/freedom.go:296-312、353-359）。Force* 解析失败直接返回错误；Use* 回退为按域名拨号（transport/internet/dialer.go:251-262），拨号后的检查仍然生效。
+- **为什么写在 sockopt**：Xray v26.10.21 已弃用 freedom 的 `settings.domainStrategy`（会打印 Warning "deprecated and will be removed"，并在加载时自动迁移到 `sockopt.domainStrategy`，infra/conf/xray.go:409-431）。freedom 实际使用的就是 `streamSettings.sockopt.domainStrategy`（proxy/freedom/freedom.go:57），取值与上表相同（infra/conf/transport_sockopt.go:95-120），所以直接写新位置，行为不变、无警告。
+- **迁移**：脚本读取现有配置时优先读 `sockopt.domainStrategy`，也识别旧的 `settings.domainStrategy`；重新配置/升级时迁移到新位置并提示。只执行 `update`（换二进制）不改配置，若校验时出现弃用 Warning，脚本会提示重新运行安装（保留密钥）完成迁移。
 
 ## 客户端
 
@@ -157,11 +194,11 @@ bash install.sh [install|update|reconfigure|info|uninstall] [--purge] [-y]
   ```
   只部署一种入站时只输出对应节点。文件不再带注释头。
 - **`vless://` 分享链接**：
-  - Encryption 链接为 `encryption=mlkem768x25519plus.random.0rtt.…&flow=xtls-rprx-vision&security=none`。
+  - Encryption 链接为 `encryption=mlkem768x25519plus.<外观>.0rtt.…&flow=xtls-rprx-vision&security=none`（默认 random）。
   - REALITY 链接为 `encryption=none&flow=xtls-rprx-vision`，`fp=chrome`（随 `CLIENT_FP`）。
   - IPv6 地址会自动加方括号。
 
-运行 `bash install.sh info` 可以随时再次查看。屏幕上和客户端文件中都不会输出服务端私钥或 seed。
+运行 `bash install.sh info` 可以随时再次查看（同时显示服务端出站 `domainStrategy` 与 Encryption 外观）。屏幕上和客户端文件中都不会输出服务端私钥或 seed。
 
 ## 卸载
 
@@ -186,13 +223,17 @@ bash install.sh uninstall --purge  # 同时删除配置和 xray 用户
 4. 运行 `sudo LEADER=… MIHOMO=… ROOTFS=… bash test/loopback-test.sh`，直接使用生成的 mihomo YAML 作为客户端（另追加一个只把指纹改成 safari 的 REALITY 副本做反例对照；UDP echo 127.0.0.1:9053 由脚本自行启动）：
    - **阶段 0**：
      - 生成的 YAML 与 `test/expected-client-format.txt`（参考格式）逐行比对；文件权限 600。
-     - 链接：Encryption 为 random.0rtt + 单个 ML-KEM-768 + vision；REALITY 为 encryption=none + vision + fp=chrome。
+     - 链接：Encryption 为 random.0rtt（默认外观）+ 单个 ML-KEM-768 + vision；REALITY 为 encryption=none + vision + fp=chrome。
      - 服务端：Encryption 入站为 random.600s、单个 seed、vision；REALITY 入站 decryption=none。
+     - direct 出站 `streamSettings.sockopt.domainStrategy` 为 `UseIPv4v6`（可用 `EXPECT_DS` 改期望值），且没有 `settings.domainStrategy`。
      - 端口落在 4000–9999。
-   - **阶段 A（生产配置）**：访问 127.0.0.1 或 localhost 的请求都必须被屏蔽。
+     - 生产配置 `xray run -test` 没有 Warning。
+     - 外观用 `EXPECT_MODE`（默认 random）指定；TLS 特征抓包断言只在 random 下执行（native/xorpub 的记录头为 `17 03 03`，按设计会被识别为 TLS 应用数据）。
+   - **阶段 A（生产配置）**：访问 127.0.0.1、localhost 或 local.test（脚本在测试容器的 /etc/hosts 中加入 `127.0.0.1 local.test`）的请求都必须被屏蔽。
    - **阶段 B（仅测试用配置）**：在生产配置前插入一个放行 `127.0.0.1:9080/9053/9443` 的例外（routing 和 finalRules 都加），写到容器的 `/run/xray-test.json`，以 xray 用户临时运行。测试完成后恢复正式服务。阶段 B 验证以下内容：
      - Encryption 节点和 REALITY 节点（原样输出，chrome）：
        - TCP 返回 200，64 MiB 下载大小正确；
+       - 经域名 `local.test:9080` 访问返回 200（由 freedom 按 `domainStrategy` 解析；只取 AAAA 的策略如 `ForceIPv6` 用 `EXPECT_DOMAIN_HTTP=000`）；
        - UDP（XUDP）echo 正常；
        - 内层 HTTPS（SNI local.test）8 MiB 下载正常。
      - **Encryption 端口抓包断言**：全程只在 lo 上抓该端口的包（tcpdump）。
@@ -202,6 +243,8 @@ bash install.sh uninstall --purge  # 同时删除配置和 xray 用户
      - REALITY safari 副本连接失败（已知不兼容，见注意事项）。
      - BitTorrent 首包被屏蔽。
      - 不带认证直连 REALITY 端口时，会被转发到 target。
+   - 可选 `SOAK_SECONDS=N`：两个节点并行循环上述流量 N 秒。
+   - **日志检查**：测试期间 xray.service 与测试单元的日志中，除启动横幅 `Xray … started` 外不得有 `[Warning]` / `[Error]` / `deprecated`；`journalctl -p warning` 对 xray 相关单元为空。
    - **这个放行例外只存在于测试配置中，脚本生成的生产配置里没有。**
 
 ## 注意事项
@@ -209,6 +252,7 @@ bash install.sh uninstall --purge  # 同时删除配置和 xray 用户
 - **指纹默认 chrome**：Xray ≥ v26.9.9 的 REALITY 会拒绝不含 X25519MLKEM768 key share 的 ClientHello。mihomo（v1.19.33，metacubex/utls v1.8.8）里只有 `chrome`（Chrome 133）带 MLKEM，`safari` 是 Safari 16.0，不带；`support-x25519mlkem768: true` 只能"不删除"指纹已有的 MLKEM，不会添加。所以 mihomo 客户端连本脚本的 REALITY 节点必须用 chrome（已实测 safari 失败）。Xray 内核客户端（v2rayN 等）的 `safari` 是 Safari 26.3，带 MLKEM，如需改用可执行 `CLIENT_FP=safari bash install.sh info`（mihomo 不可用）。
 - **Encryption 0-RTT**：服务端重启后，客户端用旧 ticket 发起的第一个 0-RTT 请求会失败，随后自动退回 1-RTT 恢复。这是协议的预期行为。
 - **REALITY target**：应选择境外、支持 TLS1.3 + h2、与服务器网络位置相近、非 CDN 落地的站点。不要用自己的域名，也不要用 Cloudflare 等 CDN 上的站点。
+- **日志里的 `[Warning] core: Xray … started`**：这是 Xray 每次启动都会打印的版本横幅，级别是 Warning（core/xray.go:400），不表示配置有问题。回环测试中（启动、重启、update、reconfigure、持续流量）除此之外没有任何 Warning/Error。如果不想看到它，只能把 `log.loglevel` 调为 `error`，但这会同时隐藏真正的警告，脚本默认保持 `warning`。
 - **nftables 规则可能被清空**：如果系统启用了 Debian 自带的 `nftables.service`，它执行 `flush ruleset` 时会清掉 `xray_connlimit` 表。可以执行 `systemctl restart xray-connlimit` 重新加载。
 - **GitHub 下载代理**：`GITHUB_PROXY` 只作用于 zip 和 `.dgst` 的下载；GitHub API 请求始终直连官方地址，用 API 返回的 digest 交叉校验代理下载的文件。手动指定版本且 API 不可达时，只能用 `.dgst` 校验并给出警告：这时 `.dgst` 与 zip 来自同一来源，请自行评估代理是否可信。
 - **`PREFIX` 模式**：仅用于测试。不装依赖、不建用户，也不涉及 systemd 和 nft。

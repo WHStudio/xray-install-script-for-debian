@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # Xray-core 服务端一键部署脚本（Debian 13）
-# VLESS + REALITY + Vision  /  VLESS Encryption + Vision (mlkem768x25519plus.random, 0-RTT)
+# VLESS + REALITY + Vision  /  VLESS Encryption + Vision (mlkem768x25519plus, 0-RTT)
 # REALITY 入站 decryption=none（按作者建议，REALITY 与 Encryption 二选一，不叠加）；
-# 独立 Encryption 入站：random（全随机外观）、600s 0-RTT ticket、单个 ML-KEM-768 密钥、flow=xtls-rprx-vision
+# 独立 Encryption 入站：native/xorpub/random 外观（默认 random）、600s 0-RTT ticket、单个 ML-KEM-768 密钥、flow=xtls-rprx-vision
+# direct 出站 freedom domainStrategy 可选（默认 UseIPv4v6）
 #
 # 交互界面与流程参考 WHStudio/mihomo-install-script-for-debian（mihomo 版），
 # 本脚本为针对 Xray-core 的独立重写实现。详见 README.zh_CN.md。
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.2.0"
+readonly SCRIPT_VERSION="1.3.0"
 
 # ── 可通过环境变量覆盖的参数 ────────────────────────────────────────────────
 XRAY_ACTION="${XRAY_ACTION:-}"            # install | update | reconfigure | info | uninstall
@@ -27,8 +28,10 @@ CLIENT_FP="${CLIENT_FP:-}"                # REALITY 节点 client-fingerprint / 
 DETECT_PUBLIC_IP="${DETECT_PUBLIC_IP:-1}" # 1 = SERVER_ADDRESS 为空时请求 api.ipify.org 探测
 LISTEN_ADDR="${LISTEN_ADDR:-}"            # 留空 = 监听所有地址
 BLOCK_BT="${BLOCK_BT:-}"                  # 1/0：屏蔽 BitTorrent（默认 1）
-ACCESS_LOG="${ACCESS_LOG:-0}"             # 1 = 访问日志写入 journal（默认关闭，保护隐私）
-NFT_CONNLIMIT="${NFT_CONNLIMIT:-}"        # 每 IP 并发连接上限；0/空 = 不启用
+ENC_MODE="${ENC_MODE:-}"                  # native | xorpub | random：Encryption 外观；留空 = 沿用已有，否则 random
+DOMAIN_STRATEGY="${DOMAIN_STRATEGY:-}"    # direct 出站 sockopt.domainStrategy；留空 = 沿用已有，否则 UseIPv4v6
+ACCESS_LOG="${ACCESS_LOG:-}"              # 1/0：访问日志写入 journal；留空 = 沿用已有，否则 0（保护隐私）
+NFT_CONNLIMIT="${NFT_CONNLIMIT:-}"        # 每 IP 并发连接上限；0 = 不启用；留空 = 沿用已有，否则不启用
 KEEP_KEYS="${KEEP_KEYS:-}"                # 1/0：重新配置时沿用已有 UUID/密钥
 PURGE="${PURGE:-0}"                       # 卸载时 1 = 同时删除配置与 xray 用户
 SKIP_START="${SKIP_START:-0}"             # 1 = 只写文件不启动服务
@@ -54,10 +57,12 @@ readonly TAG_REALITY="vless-reality"
 readonly TAG_ENC="vless-enc"
 readonly NAME_REALITY="vless-reality"     # mihomo 节点名 / 链接备注
 readonly NAME_ENC="vless-encryption"
-# VLESS Encryption：random 外观；服务端 600s 0-RTT ticket；单个 ML-KEM-768 密钥（seed 86 / client 1579）
-# （1.1.0 的 X25519+ML-KEM 双密钥、1.0.0 的 native 不再匹配，reconfigure 时会重新生成）
-readonly ENC_DEC_RE='^mlkem768x25519plus\.random\.[0-9]+(-[0-9]+)?s\.[A-Za-z0-9_-]{86}$'
-readonly ENC_ENC_RE='^mlkem768x25519plus\.random\.0rtt\.[A-Za-z0-9_-]{1579}$'
+# VLESS Encryption：native / xorpub / random 外观；服务端 600s 0-RTT ticket；单个 ML-KEM-768 密钥（seed 86 / client 1579）
+# （1.1.0 的 X25519+ML-KEM 双密钥不再匹配，reconfigure 时会重新生成）
+readonly ENC_DEC_RE='^mlkem768x25519plus\.(native|xorpub|random)\.[0-9]+(-[0-9]+)?s\.[A-Za-z0-9_-]{86}$'
+readonly ENC_ENC_RE='^mlkem768x25519plus\.(native|xorpub|random)\.0rtt\.[A-Za-z0-9_-]{1579}$'
+# direct 出站 streamSettings.sockopt.domainStrategy 可选值（Xray v26.10.21 infra/conf/transport_sockopt.go 均支持）
+readonly DS_VALUES="AsIs UseIPv4v6 UseIPv6v4 UseIPv4 UseIPv6 ForceIPv4v6 ForceIPv6v4 ForceIPv4 ForceIPv6"
 readonly VISION_FLOW="xtls-rprx-vision"
 
 TEMP_DIR=""
@@ -359,7 +364,7 @@ download_verify() {
   info "正在下载 ${ASSET_NAME} (v${TARGET_VERSION}) ..."
   curl -fsSL --retry 2 --connect-timeout 15 --proto '=https,http' -o "${zip}" "$(proxy_url "${base}")" \
     || die "下载失败：${base}"
-  curl -fsSL --retry 2 --connect-timeout 15 -o "${dgst}" "$(proxy_url "${base}.dgst")" \
+  curl -fsSL --retry 2 --connect-timeout 15 --proto '=https,http' -o "${dgst}" "$(proxy_url "${base}.dgst")" \
     || die "下载校验文件失败：${base}.dgst（拒绝在无校验的情况下安装）"
 
   actual="$(sha256sum "${zip}" | awk '{print $1}')"
@@ -420,6 +425,10 @@ jq_cfg() { jq -r "$1" "${XRAY_CONFIG}" 2>/dev/null || true; }
 load_existing() {
   OLD_R_PORT=""; OLD_R_UUID=""; OLD_R_PRIV=""; OLD_R_SID=""; OLD_R_TARGET=""; OLD_R_SNI=""
   OLD_E_PORT=""; OLD_E_UUID=""; OLD_E_DEC=""; OLD_BT=""; OLD_LISTEN=""; OLD_R_DEC=""; OLD_E_FLOW=""
+  OLD_E_MODE=""; OLD_DS=""; OLD_DS_LEGACY=0; OLD_ACCESS=""; OLD_NFT=""
+  if [[ -f "${NFT_FILE}" ]]; then
+    OLD_NFT="$(sed -nE 's/.*ct count over ([0-9]+).*/\1/p' "${NFT_FILE}" | head -n1)"
+  fi
   [[ -f "${XRAY_CONFIG}" ]] || return 0
   local r=".inbounds[]? | select(.tag==\"${TAG_REALITY}\")" e=".inbounds[]? | select(.tag==\"${TAG_ENC}\")"
   OLD_R_PORT="$(jq_cfg "${r} | .port")"
@@ -434,6 +443,15 @@ load_existing() {
   OLD_E_DEC="$(jq_cfg "${e} | .settings.decryption")"
   OLD_E_FLOW="$(jq_cfg "${e} | .settings.clients[0].flow // empty")"
   OLD_LISTEN="$(jq_cfg '[.inbounds[]? | .listen // empty][0] // empty')"
+  if [[ "${OLD_E_DEC}" =~ ^mlkem768x25519plus\.(native|xorpub|random)\. ]]; then OLD_E_MODE="${BASH_REMATCH[1]}"; fi
+  # 写在 streamSettings.sockopt.domainStrategy；也识别已弃用的 settings.domainStrategy（Xray 会打印弃用警告），重新配置时迁移
+  local d=".outbounds[]? | select(.tag==\"direct\")"
+  OLD_DS="$(jq_cfg "[${d} | .streamSettings.sockopt.domainStrategy // empty][0] // empty")"
+  if [[ -z "${OLD_DS}" ]]; then
+    OLD_DS="$(jq_cfg "[${d} | .settings.domainStrategy // empty][0] // empty")"
+    [[ -z "${OLD_DS}" ]] || OLD_DS_LEGACY=1
+  fi
+  if [[ "$(jq_cfg '.log.access // "none"')" == "none" ]]; then OLD_ACCESS=0; else OLD_ACCESS=1; fi
   if [[ -n "$(jq_cfg '.routing.rules[]? | select(.protocol? | index("bittorrent")) | .outboundTag')" ]]; then OLD_BT=1; else OLD_BT=0; fi
 }
 
@@ -471,8 +489,8 @@ gen_enc_pair() {
   m="$("${XRAY_BIN}" mlkem768 | tr -d '\r')"
   seed="$(awk -F': *' '$1 == "Seed" { print $2; exit }' <<< "${m}")"
   client="$(awk -F': *' '$1 == "Client" { print $2; exit }' <<< "${m}")"
-  GEN_DEC="mlkem768x25519plus.random.600s.${seed}"
-  GEN_ENC="mlkem768x25519plus.random.0rtt.${client}"
+  GEN_DEC="mlkem768x25519plus.${ENC_MODE}.600s.${seed}"
+  GEN_ENC="mlkem768x25519plus.${ENC_MODE}.0rtt.${client}"
   [[ "${GEN_DEC}" =~ ${ENC_DEC_RE} && "${GEN_ENC}" =~ ${ENC_ENC_RE} ]] || die "VLESS Encryption 密钥生成/解析失败"
 }
 
@@ -489,14 +507,19 @@ yaml_val() {
 
 # ── 配置问答 ───────────────────────────────────────────────────────────────
 choose_mode() {
+  # 重新配置时默认沿用现有部署模式
+  local dm=both dn=1
+  if [[ -n "${OLD_R_PRIV}" && -z "${OLD_E_DEC}" ]]; then dm=reality; dn=2
+  elif [[ -z "${OLD_R_PRIV}" && -n "${OLD_E_DEC}" ]]; then dm=enc; dn=3; fi
   if [[ -z "${DEPLOY_MODE}" && "${INTERACTIVE}" -eq 1 ]]; then
     section "部署模式"
-    menu_item "1" "两者都部署" "[默认] REALITY 直连 + Encryption 备用/中转"
-    menu_item "2" "仅 VLESS + REALITY + Vision（叠加 Encryption）"
-    menu_item "3" "仅 VLESS Encryption (random, 0-RTT)"
+    local m1="" m2="" m3=""; printf -v "m${dn}" '%s' "[默认] "
+    menu_item "1" "两者都部署" "${m1}REALITY 直连 + Encryption 备用/中转"
+    menu_item "2" "仅 VLESS + REALITY + Vision" "${m2% }"
+    menu_item "3" "仅 VLESS Encryption (0-RTT + Vision)" "${m3% }"
     printf '\n' >&2
     while true; do
-      ask "请输入选项 [1-3]" "1"
+      ask "请输入选项 [1-3]" "${dn}"
       case "${REPLY}" in
         1) DEPLOY_MODE=both; break ;;
         2) DEPLOY_MODE=reality; break ;;
@@ -505,7 +528,7 @@ choose_mode() {
       esac
     done
   fi
-  DEPLOY_MODE="${DEPLOY_MODE:-both}"
+  DEPLOY_MODE="${DEPLOY_MODE:-${dm}}"
   case "${DEPLOY_MODE}" in
     both) DO_REALITY=1; DO_ENC=1 ;;
     reality) DO_REALITY=1; DO_ENC=0 ;;
@@ -567,14 +590,18 @@ check_target() {
 }
 
 configure_reality() {
-  section "VLESS + REALITY + Vision（叠加 VLESS Encryption）"
+  section "VLESS + REALITY + Vision"
   local def_port="${OLD_R_PORT:-443}" def_target="${OLD_R_TARGET}" sni_def tgt
   [[ "${KEEP}" -eq 1 ]] || def_port=443
   pick_port "REALITY" "${def_port}" "" "${REALITY_PORT}"
   R_PORT="${SELECTED_PORT}"
+  [[ "${R_PORT}" == 443 ]] || warn "REALITY 不在 443 端口：Xray 启动时会打印警告（Listening on non-443 ports will increase the likelihood of your server's IP being blocked）"
 
   info "target 应为境外、支持 TLS1.3 + h2、非 CDN、与本机同地区的网站（不要用自己的域名，也不要用 Apple/Cloudflare 等大站）"
   tgt="${REALITY_TARGET}"
+  if [[ -z "${tgt}" && "${INTERACTIVE}" -ne 1 && -n "${def_target}" ]]; then
+    tgt="${def_target}"; info "沿用已有 REALITY target：${tgt}"
+  fi
   while true; do
     if [[ -z "${tgt}" ]]; then
       [[ "${INTERACTIVE}" -eq 1 ]] || die "非交互模式必须设置 REALITY_TARGET（如 www.example.com:443）"
@@ -607,6 +634,12 @@ configure_reality() {
     warn "serverNames 必须是域名列表"; sni_in=""
   done
   ok "serverNames → ${C_BOLD}${R_SNIS[*]}${C_RESET}"
+  for s in "${R_SNIS[@]}"; do
+    case "${s,,}" in
+      *.ru|*.ir|*.cn|*apple*|*icloud*|*microsoft*)
+        warn "serverName ${s}：Xray 认为此类目标（.cn/.ru/.ir、apple/icloud/microsoft）更容易导致 IP 被封，启动时会打印警告" ;;
+    esac
+  done
 
   local do_check=0
   if [[ -n "${CHECK_TARGET}" ]]; then is_true "${CHECK_TARGET}" && do_check=1
@@ -648,8 +681,40 @@ reality_keys() {
   [[ "${R_SID}" =~ ^[0-9a-f]{0,16}$ ]] || die "shortId 无效"
 }
 
+enc_mode_menu() {
+  printf '\n' >&2
+  menu_item "1" "native" "TLS 1.3 记录头外观；可 splice"
+  printf '        %s优势：配合 Vision 服务端可 splice（零拷贝，性能最好）；作者推荐 native/xorpub + Vision%s\n' "${C_DIM}" "${C_RESET}" >&2
+  printf '        %s风险：数据记录头为 17 03 03，tshark 会标为 TLS Application Data（无握手/SNI/JA3）；握手中的公钥字节未隐藏%s\n' "${C_DIM}" "${C_RESET}" >&2
+  menu_item "2" "xorpub" "在 native 基础上隐藏公钥字节"
+  printf '        %s优势：同 native（可 splice，作者推荐），另对握手中的 X25519 公钥 / ML-KEM 密文做 XOR%s\n' "${C_DIM}" "${C_RESET}" >&2
+  printf '        %s风险：数据记录头仍为 17 03 03，同样被识别为 TLS Application Data（无握手/SNI/JA3）%s\n' "${C_DIM}" "${C_RESET}" >&2
+  menu_item "3" "random" "全随机外观（新装默认）"
+  printf '        %s优势：记录头也做 XOR，抓包无 TLS 特征（本项目回环抓包已验证）%s\n' "${C_DIM}" "${C_RESET}" >&2
+  printf '        %s风险：不能 splice，性能低于 native/xorpub；作者称 GFW 已将全随机外观列入黑名单（未核实）%s\n' "${C_DIM}" "${C_RESET}" >&2
+  printf '\n' >&2
+}
+
 configure_enc() {
-  section "VLESS Encryption (mlkem768x25519plus.random, 0-RTT)"
+  section "VLESS Encryption (mlkem768x25519plus, 0-RTT)"
+  local def_mode="${OLD_E_MODE:-random}" n
+  if [[ -z "${ENC_MODE}" && "${INTERACTIVE}" -eq 1 ]]; then
+    info "选择 Encryption 流量外观（两端必须一致；均为单个 ML-KEM-768 密钥 + Vision）："
+    enc_mode_menu
+    case "${def_mode}" in native) n=1 ;; xorpub) n=2 ;; *) n=3 ;; esac
+    while true; do
+      ask "请输入选项 [1-3]" "${n}"
+      case "${REPLY}" in
+        1|native) ENC_MODE=native; break ;;
+        2|xorpub) ENC_MODE=xorpub; break ;;
+        3|random) ENC_MODE=random; break ;;
+        *) warn "选项无效，请重新输入" ;;
+      esac
+    done
+  fi
+  ENC_MODE="${ENC_MODE:-${def_mode}}"
+  [[ "${ENC_MODE}" =~ ^(native|xorpub|random)$ ]] || die "ENC_MODE 只能是 native / xorpub / random"
+  ok "Encryption 外观：${ENC_MODE}"
   local def_port
   if [[ "${KEEP}" -eq 1 && -n "${OLD_E_PORT}" ]]; then def_port="${OLD_E_PORT}"; else def_port="$(random_port "${R_PORT:-}")"; fi
   [[ "${def_port}" != "${R_PORT:-}" ]] || def_port="$(random_port "${R_PORT:-}")"
@@ -666,16 +731,22 @@ enc_keys() {
     [[ "${E_UUID}" != "${R_UUID:-}" ]] || E_UUID="$("${XRAY_BIN}" uuid | tr -d '\r\n')"
   fi
   if [[ "${KEEP}" -eq 1 && "${OLD_E_DEC}" =~ ${ENC_DEC_RE} ]]; then
-    E_DEC="${OLD_E_DEC}"
+    # 密钥与外观无关：只替换外观段，seed / ticket 保持不变
+    local -a parts
+    IFS='.' read -r -a parts <<< "${OLD_E_DEC}"
+    E_DEC="${parts[0]}.${ENC_MODE}.${parts[2]}.${parts[3]}"
     E_ENC="$(enc_client_from_dec "${E_DEC}")" || die "无法从现有 decryption 推导客户端 encryption"
     info "沿用已有 Encryption 密钥"
+    if [[ "${OLD_E_MODE}" != "${ENC_MODE}" ]]; then
+      warn "Encryption 外观 ${OLD_E_MODE} → ${ENC_MODE}：所有客户端的 ${NAME_ENC} 节点都必须更新 encryption 字段（密钥不变）"
+    fi
     [[ "${OLD_E_FLOW}" == "${VISION_FLOW}" ]] || warn "Encryption 入站新增 flow=${VISION_FLOW}：客户端需要更新"
   else
     gen_enc_pair
     E_DEC="${GEN_DEC}"; E_ENC="${GEN_ENC}"
-    ok "已生成 VLESS Encryption 密钥（单个 ML-KEM-768，random / 0-RTT）"
+    ok "已生成 VLESS Encryption 密钥（单个 ML-KEM-768，${ENC_MODE} / 0-RTT）"
     if [[ "${KEEP}" -eq 1 && -n "${OLD_E_DEC}" ]]; then
-      warn "旧版（1.0.0/1.1.0）Encryption 配置已升级为 random + 单个 ML-KEM-768 + Vision，密钥已重新生成："
+      warn "旧版（1.1.0）Encryption 配置已升级为 ${ENC_MODE} + 单个 ML-KEM-768 + Vision，密钥已重新生成："
       warn "  所有客户端的 ${NAME_ENC} 节点都必须更新（UUID 与端口不变）"
     fi
   fi
@@ -684,10 +755,60 @@ enc_keys() {
   [[ "${E_ENC}" =~ ${ENC_ENC_RE} ]] || die "encryption 解析失败"
 }
 
+# 规范化 domainStrategy（大小写不敏感）-> 标准写法；无效返回 1
+canon_ds() {
+  local v
+  for v in ${DS_VALUES}; do
+    if [[ "${1,,}" == "${v,,}" ]]; then printf '%s\n' "${v}"; return 0; fi
+  done
+  return 1
+}
+
+configure_dns() {
+  section "出站 DNS 解析策略（direct 出站 sockopt.domainStrategy）"
+  local def="UseIPv4v6" fam n c
+  [[ "${OLD_DS_LEGACY}" -eq 0 ]] || info "已有配置使用已弃用的 freedom settings.domainStrategy=${OLD_DS}，将迁移到 streamSettings.sockopt.domainStrategy（行为不变）"
+  if [[ -n "${OLD_DS}" ]]; then
+    if c="$(canon_ds "${OLD_DS}")"; then def="${c}"; else warn "已有 domainStrategy=${OLD_DS} 不在可选列表中，改用默认 UseIPv4v6"; fi
+  fi
+  if [[ -z "${DOMAIN_STRATEGY}" && "${INTERACTIVE}" -eq 1 ]]; then
+    info "AsIs = 交给系统解析；Use* = Xray 内置解析，失败后回退到系统处理；Force* = 内置解析，失败不回退"
+    info "v4 / v6 = 只解析该协议；v4v6 = 先 IPv4 后 IPv6；v6v4 = 先 IPv6 后 IPv4（当前默认：${def}）"
+    if yes_no "域名解析交给系统处理（AsIs）？" "$([[ ${def} == AsIs ]] && echo 1 || echo 0)"; then
+      DOMAIN_STRATEGY=AsIs
+    else
+      local pre="Use"
+      if ! yes_no "Xray 内置解析失败后回退到系统处理？（是 = Use*，否 = Force*）" "$([[ ${def} == Force* ]] && echo 0 || echo 1)"; then pre="Force"; fi
+      fam="${def#Use}"; fam="${fam#Force}"
+      case "${fam}" in IPv4) n=1 ;; IPv6) n=2 ;; IPv6v4) n=4 ;; *) n=3 ;; esac
+      printf '\n' >&2
+      menu_item "1" "v4" "只解析 IPv4"
+      menu_item "2" "v6" "只解析 IPv6"
+      menu_item "3" "v4v6" "先 IPv4 后 IPv6$([[ ${n} == 3 ]] && echo '（默认）')"
+      menu_item "4" "v6v4" "先 IPv6 后 IPv4"
+      printf '\n' >&2
+      while true; do
+        ask "请选择解析顺序 [1-4]" "${n}"
+        case "${REPLY}" in
+          1|v4) fam=IPv4; break ;;
+          2|v6) fam=IPv6; break ;;
+          3|v4v6) fam=IPv4v6; break ;;
+          4|v6v4) fam=IPv6v4; break ;;
+          *) warn "选项无效，请重新输入" ;;
+        esac
+      done
+      DOMAIN_STRATEGY="${pre}${fam}"
+    fi
+  fi
+  DOMAIN_STRATEGY="${DOMAIN_STRATEGY:-${def}}"
+  DOMAIN_STRATEGY="$(canon_ds "${DOMAIN_STRATEGY}")" || die "DOMAIN_STRATEGY 只能是：${DS_VALUES// / | }"
+  ok "出站 domainStrategy：${DOMAIN_STRATEGY}"
+}
+
 configure_misc() {
   section "安全与其他选项"
   if [[ -z "${BLOCK_BT}" ]]; then
-    local d=1; [[ "${KEEP}" -eq 1 && -n "${OLD_BT}" ]] && d="${OLD_BT}"
+    local d="${OLD_BT:-1}"
     if yes_no "屏蔽 BitTorrent 流量？（启用 routeOnly 嗅探）" "${d}"; then BLOCK_BT=1; else BLOCK_BT=0; fi
   fi
   is_true "${BLOCK_BT}" && BLOCK_BT=1 || BLOCK_BT=0
@@ -695,9 +816,12 @@ configure_misc() {
   ok "BitTorrent 屏蔽：$([[ ${BLOCK_BT} -eq 1 ]] && echo 启用 || echo 关闭)"
 
   if [[ -z "${NFT_CONNLIMIT}" ]]; then
-    if [[ "${INTERACTIVE}" -eq 1 && "${STAGING}" -eq 0 ]] && yes_no "启用 nftables 每 IP 并发连接数限制？" 0; then
+    local nd=0; [[ -n "${OLD_NFT}" ]] && nd=1
+    if [[ "${INTERACTIVE}" -ne 1 || "${STAGING}" -eq 1 ]]; then
+      NFT_CONNLIMIT="${OLD_NFT:-0}"
+    elif yes_no "启用 nftables 每 IP 并发连接数限制？" "${nd}"; then
       while true; do
-        ask "每个源 IP 最大并发连接数" "64"
+        ask "每个源 IP 最大并发连接数" "${OLD_NFT:-64}"
         [[ "${REPLY}" =~ ^[1-9][0-9]{0,5}$ ]] && break
         warn "请输入正整数"
       done
@@ -708,6 +832,10 @@ configure_misc() {
   fi
   [[ "${NFT_CONNLIMIT}" =~ ^[0-9]{1,6}$ ]] || die "NFT_CONNLIMIT 必须是数字"
   if [[ "${NFT_CONNLIMIT}" != 0 ]]; then ok "nftables 每 IP 并发上限：${NFT_CONNLIMIT}"; else ok "nftables 连接限制：不启用"; fi
+
+  ACCESS_LOG="${ACCESS_LOG:-${OLD_ACCESS:-0}}"
+  is_true "${ACCESS_LOG}" && ACCESS_LOG=1 || ACCESS_LOG=0
+  [[ "${ACCESS_LOG}" -eq 0 ]] || warn "访问日志已开启（ACCESS_LOG=1）：客户端 IP 与访问目标会写入 journal"
 
   LISTEN_ADDR="${LISTEN_ADDR:-${OLD_LISTEN:-}}"
   if [[ -n "${LISTEN_ADDR}" ]]; then
@@ -737,8 +865,8 @@ build_config() {
       } + (if $sniff then { sniffing: $sniff } else {} end)]')"
   fi
   if [[ "${DO_ENC}" -eq 1 ]]; then
-    # flow=xtls-rprx-vision：Vision 填充 + 内层 TLS 直连复制；random 外观不会 splice（inbound.go:563-565），
-    # 但整条流量（含 5 字节记录头）全随机，无 TLS 特征
+    # flow=xtls-rprx-vision：Vision 填充 + 内层 TLS 直连复制；native/xorpub 可 splice，
+    # random 不会 splice（inbound.go:563-565），但整条流量（含 5 字节记录头）全随机，无 TLS 特征
     inbounds="$(jq -n --argjson acc "${inbounds}" --arg tag "${TAG_ENC}" --argjson port "${E_PORT}" \
       --arg id "${E_UUID}" --arg dec "${E_DEC}" --arg flow "${E_FLOW}" --argjson sniff "${sniff}" '
       $acc + [{
@@ -751,12 +879,13 @@ build_config() {
     inbounds="$(jq --arg l "${LISTEN_ADDR}" 'map(. + { listen: $l })' <<< "${inbounds}")"
   fi
   local access="none"; is_true "${ACCESS_LOG}" && access=""
-  jq -n --argjson inbounds "${inbounds}" --arg access "${access}" --argjson bt "${BLOCK_BT}" '{
+  jq -n --argjson inbounds "${inbounds}" --arg access "${access}" --argjson bt "${BLOCK_BT}" --arg ds "${DOMAIN_STRATEGY}" '{
     log: { loglevel: "warning", access: $access, dnsLog: false },
     inbounds: $inbounds,
     outbounds: [
       { tag: "direct", protocol: "freedom",
-        settings: { finalRules: [ { action: "block", ip: ["geoip:private"] } ] } },
+        settings: { finalRules: [ { action: "block", ip: ["geoip:private"] } ] },
+        streamSettings: { sockopt: { domainStrategy: $ds } } },
       { tag: "block", protocol: "blackhole" }
     ],
     routing: {
@@ -774,6 +903,13 @@ test_config() {
     # 输出可能包含私钥，只显示错误行并去掉长字符串
     grep -iE 'fail|error|invalid' <<< "${log}" | sed -E 's/[A-Za-z0-9_-]{40,}/<已隐藏>/g' >&2 || true
     return 1
+  fi
+  if grep -q '\[Warning\]' <<< "${log}"; then
+    warn "xray run -test 输出了警告："
+    grep '\[Warning\]' <<< "${log}" | sed -E 's/^[0-9\/]+ [0-9:.]+ //; s/[A-Za-z0-9_-]{40,}/<已隐藏>/g' | while IFS= read -r l; do warn "  ${l}"; done
+    if grep -qi 'deprecated' <<< "${log}"; then
+      info "配置含已弃用字段：重新运行安装并选择保留现有密钥即可迁移到新写法"
+    fi
   fi
   ok "配置校验通过"
 }
@@ -919,7 +1055,10 @@ restart_service() {
   systemctl daemon-reload
   if [[ -f "${NFT_UNIT}" ]]; then
     systemctl enable xray-connlimit.service >/dev/null 2>&1
-    systemctl restart xray-connlimit.service || die "nftables 连接限制加载失败"
+    # 连接数限制是可选加固：失败时不中止（否则新配置已写入但 xray 未重启、客户端文件未更新）
+    if ! systemctl restart xray-connlimit.service; then
+      warn "nftables 连接限制加载失败，xray 仍会启动；排查：journalctl -u xray-connlimit（容器内通常缺少 CAP_NET_ADMIN）"
+    fi
   fi
   systemctl enable xray.service >/dev/null 2>&1
   systemctl reset-failed xray.service >/dev/null 2>&1 || true
@@ -1025,6 +1164,8 @@ print_client_info() {
   cat "${LINKS_FILE}"
   printf '\n' >&2
   info "服务器地址：${C_BOLD}${SERVER_ADDRESS}${C_RESET}"
+  info "服务端出站 domainStrategy：${DOMAIN_STRATEGY:-AsIs（未设置）}"
+  [[ "${DO_ENC}" -eq 1 && -n "${ENC_MODE:-}" ]] && info "Encryption 外观：${ENC_MODE}（客户端 encryption 字段需一致）"
   info "请在防火墙/安全组放行 TCP 端口：${C_BOLD}${ports[*]}${C_RESET}"
   info "客户端 YAML：${CLIENT_YAML#"${ROOT}"}（权限 600）；链接：${LINKS_FILE#"${ROOT}"}"
   info "以上仅含客户端所需的公开参数，服务端私钥只保存在 ${XRAY_CONFIG#"${ROOT}"}（640 root:xray）"
@@ -1038,8 +1179,8 @@ print_client_info() {
   if [[ "${DO_ENC}" -eq 1 || -n "${R_ENC:-}" ]]; then
     info "VLESS Encryption 0-RTT：服务端重启后客户端缓存的 ticket 失效，首个连接可能失败，随后自动恢复"
   fi
-  if [[ -n "${R_ENC:-}" || ( "${DO_ENC}" -eq 1 && ! "${E_DEC:-${OLD_E_DEC:-}}" =~ ${ENC_DEC_RE} ) ]]; then
-    warn "当前为旧版（<1.2.0）配置，建议运行 reconfigure 升级（Encryption 改为 random + 单个 ML-KEM-768 + Vision；REALITY 不叠加 Encryption），之后客户端需要更新"
+  if [[ -n "${R_ENC:-}" || ( "${DO_ENC}" -eq 1 && ( ! "${E_DEC:-${OLD_E_DEC:-}}" =~ ${ENC_DEC_RE} || "${E_FLOW:-}" != "${VISION_FLOW}" ) ) ]]; then
+    warn "当前为旧版（<1.2.0）配置，建议运行 reconfigure 升级（Encryption 改为单个 ML-KEM-768 + Vision；REALITY 不叠加 Encryption），之后客户端需要更新"
   fi
 }
 
@@ -1067,6 +1208,7 @@ do_install() {
   R_PORT=""
   if [[ "${DO_REALITY}" -eq 1 ]]; then configure_reality; fi
   if [[ "${DO_ENC}" -eq 1 ]]; then configure_enc; fi
+  configure_dns
   configure_misc
 
   resolve_release
@@ -1109,6 +1251,10 @@ do_install() {
   section "启动服务"
   restart_service
 
+  if [[ -z "${SERVER_ADDRESS}" && -f "${CLIENT_YAML}" ]]; then
+    SERVER_ADDRESS="$(awk '/^    server: / { print $2; exit }' "${CLIENT_YAML}" | tr -d '"')"
+    [[ "${SERVER_ADDRESS}" != "YOUR_SERVER_IP" ]] || SERVER_ADDRESS=""
+  fi
   detect_address
   write_client_files
   success_box "安装完成：Xray-core v${TARGET_VERSION}"
@@ -1153,8 +1299,9 @@ load_for_info() {
     fi
     IFS=',' read -r -a R_SNIS <<< "${OLD_R_SNI}"
   fi
+  DOMAIN_STRATEGY="${OLD_DS}"
   if [[ -n "${OLD_E_DEC}" ]]; then
-    DO_ENC=1; E_PORT="${OLD_E_PORT}"; E_UUID="${OLD_E_UUID}"; E_FLOW="${OLD_E_FLOW}"
+    DO_ENC=1; E_PORT="${OLD_E_PORT}"; E_UUID="${OLD_E_UUID}"; E_FLOW="${OLD_E_FLOW}"; ENC_MODE="${OLD_E_MODE}"
     E_ENC="$(enc_client_from_dec "${OLD_E_DEC}")" || die "无法推导 encryption"
   fi
 }
@@ -1181,7 +1328,15 @@ do_uninstall() {
   fi
   rm -f "${XRAY_UNIT}" "${NFT_UNIT}" "${XRAY_BIN}"
   rm -rf "${XRAY_SHARE}"
-  [[ "${USE_SYSTEMD}" -eq 0 ]] || systemctl daemon-reload || true
+  if [[ "${USE_SYSTEMD}" -eq 1 ]]; then
+    systemctl daemon-reload || true
+    # 清掉已删除单元残留的 failed 状态（systemctl --failed 中不再显示）
+    systemctl reset-failed xray.service xray-connlimit.service >/dev/null 2>&1 || true
+  fi
+  # 单元未运行时 ExecStop 不会执行，这里再确保删除 nft 表
+  if [[ "${STAGING}" -eq 0 ]] && command -v nft >/dev/null 2>&1 && nft list table inet xray_connlimit >/dev/null 2>&1; then
+    nft delete table inet xray_connlimit 2>/dev/null || true
+  fi
   ok "已删除二进制、数据文件与 systemd 服务"
   if [[ "${PURGE}" == 1 ]]; then
     rm -rf "${XRAY_ETC}"
