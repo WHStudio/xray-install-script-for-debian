@@ -21,5 +21,5 @@ while True:
         print(f"Q: {q.strip()}  ->  A: {a!r}")
         os.write(fd, (a + "\n").encode()); i += 1; buf = b""
 _, st = os.waitpid(pid, 0)
-open("/tmp/xit-pty.log", "wb").write(out)
+open(os.environ.get("PTY_LOG", "/tmp/xit-pty.log"), "wb").write(out)
 print("exit", os.waitstatus_to_exitcode(st))
